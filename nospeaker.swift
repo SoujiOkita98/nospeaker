@@ -1532,6 +1532,267 @@ func signOff(seconds: Int, actuations: Int) {
 
 // MARK: - Main
 
+// MARK: - Agent messaging
+
+let linkFrequencies: [Double] = [1510, 1730]
+let linkMaximumBytes = 160
+let linkStart = 2
+let linkWindowSeconds = 0.015
+let linkSlotWindows = 8
+let linkPreambleWindows = 24
+
+func linkChecksum(_ bytes: [UInt8]) -> UInt16 {
+    var crc: UInt16 = 0xffff
+    for byte in bytes {
+        crc ^= UInt16(byte) << 8
+        for _ in 0..<8 {
+            let highBit = crc & 0x8000 != 0
+            crc <<= 1
+            if highBit { crc ^= 0x1021 }
+        }
+    }
+    return crc
+}
+
+func linkFrame(_ payload: [UInt8]) -> [Int] {
+    let body = [UInt8(payload.count)] + payload
+    let checksum = linkChecksum(body)
+    let bytes = body + [UInt8(checksum >> 8), UInt8(truncatingIfNeeded: checksum)]
+    return [linkStart] + bytes.flatMap { byte in
+        (0...7).reversed().map { shift in Int((byte >> shift) & 1) }
+    }
+}
+
+struct LinkDecoder {
+    private var active = false
+    private var byte: UInt8 = 0
+    private var digits = 0
+    private var bytes: [UInt8] = []
+
+    var isActive: Bool { active }
+
+    mutating func accept(_ symbol: Int) -> String? {
+        if symbol == linkStart {
+            self = LinkDecoder()
+            active = true
+            return nil
+        }
+        guard active else { return nil }
+        byte = (byte << 1) | UInt8(symbol)
+        digits += 1
+        guard digits == 8 else { return nil }
+        bytes.append(byte)
+        byte = 0
+        digits = 0
+        let length = Int(bytes[0])
+        guard (1...linkMaximumBytes).contains(length) else {
+            active = false
+            return nil
+        }
+        guard bytes.count == length + 3 else { return nil }
+        active = false
+        let expected = UInt16(bytes[length + 1]) << 8 | UInt16(bytes[length + 2])
+        guard linkChecksum(Array(bytes.prefix(length + 1))) == expected else { return nil }
+        return String(bytes: bytes[1...length], encoding: .utf8)
+    }
+}
+
+final class LinkReceiver {
+    let ready = DispatchSemaphore(value: 0)
+    private let coefficients: [Double]
+    private let exactWindow: Double
+    private var window: Int
+    private var windowRemainder = 0.0
+    private var samples: [Double] = []
+    private var decoder = LinkDecoder()
+    private var position = 0
+    private var preambleHits = 0
+    private var bitScore = 0.0
+    private(set) var message: String?
+
+    init(sampleRate: Double) {
+        exactWindow = sampleRate * linkWindowSeconds
+        window = Int(exactWindow.rounded())
+        windowRemainder = exactWindow - Double(window)
+        coefficients = linkFrequencies.map { 2 * cos(2 * .pi * $0 / sampleRate) }
+        samples.reserveCapacity(window)
+    }
+
+    func consume(_ input: UnsafeBufferPointer<Float>) {
+        guard message == nil else { return }
+        for sample in input {
+            samples.append(Double(sample))
+            guard samples.count == window else { continue }
+            let score = measure()
+            samples.removeAll(keepingCapacity: true)
+            let nextWindow = exactWindow + windowRemainder
+            window = Int(nextWindow.rounded())
+            windowRemainder = nextWindow - Double(window)
+            if let text = decode(score) {
+                message = text
+                ready.signal()
+                return
+            }
+        }
+    }
+
+    // The long first tone establishes timing. Each following slot carries one bit.
+    private func decode(_ score: Double) -> String? {
+        if position == 0 {
+            guard score < -0.5 else { return nil }
+            position = 1
+            preambleHits = 1
+            return nil
+        }
+        let index = position
+        position += 1
+        if index < 16 {
+            if score < -0.5 { preambleHits += 1 }
+            if index == 15 {
+                guard preambleHits >= 9 else {
+                    position = 0
+                    return nil
+                }
+                _ = decoder.accept(linkStart)
+            }
+        }
+        guard index >= linkPreambleWindows else { return nil }
+        let offset = (index - linkPreambleWindows) % linkSlotWindows
+        if (1...4).contains(offset) { bitScore += score }
+        guard offset == 4 else { return nil }
+        let text = decoder.accept(bitScore > 0 ? 1 : 0)
+        bitScore = 0
+        if !decoder.isActive { position = 0 }
+        return text
+    }
+
+    private func measure() -> Double {
+        let energy = samples.reduce(0) { $0 + $1 * $1 }
+        guard energy > 1e-8 else { return 0 }
+        let powers = coefficients.map { coefficient in
+            var previous = 0.0
+            var older = 0.0
+            for sample in samples {
+                let next = sample + coefficient * previous - older
+                older = previous
+                previous = next
+            }
+            return previous * previous + older * older - coefficient * previous * older
+        }
+        let total = powers[0] + powers[1]
+        guard total > 0.06 * energy * Double(window) else { return 0 }
+        return (powers[1] - powers[0]) / total
+    }
+}
+
+func linkStatus(_ text: String) {
+    FileHandle.standardError.write(Data((text + "\n").utf8))
+}
+
+func linkOutput(_ status: String, text: String? = nil) {
+    var result = ["status": status]
+    result["text"] = text
+    print(String(decoding: try! JSONEncoder().encode(result), as: UTF8.self))
+}
+
+func sendLink() {
+    var data = Data()
+    do {
+        while data.count < linkMaximumBytes + 3 {
+            let remaining = linkMaximumBytes + 3 - data.count
+            guard let chunk = try FileHandle.standardInput.read(upToCount: remaining), !chunk.isEmpty else { break }
+            data.append(chunk)
+        }
+    } catch {
+        usageError("Could not read the message from stdin.")
+    }
+    guard var text = String(data: data, encoding: .utf8) else {
+        usageError("send expects UTF-8 on stdin.")
+    }
+    if text.last == "\n" || text.last == "\r\n" { text.removeLast() }
+    let payload = Array(text.utf8)
+    guard (1...linkMaximumBytes).contains(payload.count) else {
+        usageError("Message must be 1–160 UTF-8 bytes.")
+    }
+    let actuator = openMotor()
+    motorPointer = Unmanaged.passUnretained(actuator as AnyObject).toOpaque()
+    defer {
+        motorPointer = nil
+        _ = actuatorClose?(actuator)
+    }
+    linkStatus("Sending through the trackpad: " + String(reflecting: text))
+    let start = mach_absolute_time()
+    var slotStart = 0.0
+    for symbol in linkFrame(payload) {
+        guard !interrupted() else { linkOutput("cancelled"); return }
+        let preamble = symbol == linkStart
+        let duration = preamble ? 0.23 : 0.075
+        let hz = linkFrequencies[preamble ? 0 : symbol]
+        let segment = (0.018 * hz).rounded() / hz
+        var elapsed = 0.0
+        while elapsed < duration && !interrupted() {
+            play([(hz, 1)], ms: segment * 1000, level: 1)
+            elapsed += segment
+            waitUntil(start + UInt64((slotStart + elapsed) * ticksPerSecond))
+        }
+        slotStart += Double(preamble ? linkPreambleWindows : linkSlotWindows) * linkWindowSeconds
+        waitUntil(start + UInt64(slotStart * ticksPerSecond))
+    }
+    if interrupted() { linkOutput("cancelled") }
+    else { linkOutput("sent", text: text) }
+}
+
+func receiveLink(timeout: Int) {
+    if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+        let requested = DispatchSemaphore(value: 0)
+        AVCaptureDevice.requestAccess(for: .audio) { _ in requested.signal() }
+        while requested.wait(timeout: .now() + 0.1) == .timedOut {
+            if interrupted() { linkOutput("cancelled"); exit(130) }
+        }
+    }
+    guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
+        fail("Allow microphone access for your terminal in System Settings → Privacy & Security → Microphone.",
+             headline: "Microphone access required.")
+    }
+
+    let engine = AVAudioEngine()
+    let input = engine.inputNode
+    let format = input.outputFormat(forBus: 0)
+    guard format.sampleRate >= 8000, format.channelCount > 0, format.commonFormat == .pcmFormatFloat32 else {
+        fail("The default audio input is unavailable or uses an unsupported format.", headline: "Microphone unavailable.")
+    }
+    let receiver = LinkReceiver(sampleRate: format.sampleRate)
+    input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        guard let channel = buffer.floatChannelData?[0] else { return }
+        receiver.consume(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+    }
+    do {
+        try engine.start()
+    } catch {
+        fail(error.localizedDescription, headline: "Could not start the microphone.")
+    }
+    linkStatus("Listening for a trackpad message for up to \(timeout) seconds. Press Ctrl-C to stop.")
+    let deadline = DispatchTime.now() + .seconds(timeout)
+    var received: String?
+    while !interrupted() && DispatchTime.now() < deadline {
+        if receiver.ready.wait(timeout: min(deadline, .now() + 0.1)) == .success {
+            received = receiver.message
+            break
+        }
+    }
+    engine.stop()
+    input.removeTap(onBus: 0)
+    if let received {
+        linkOutput("received", text: received)
+    } else if interrupted() {
+        linkOutput("cancelled")
+        exit(130)
+    } else {
+        linkOutput("timeout")
+        exit(2)
+    }
+}
+
 var args = Array(CommandLine.arguments.dropFirst())
 /// The value after `flag` (and removes both), or nil if the flag isn't there. A flag with no value is a mistake.
 func option(_ flag: String, example: String) -> String? {
@@ -1548,6 +1809,8 @@ if flag("--help") || flag("-h") {
 
       nospeaker                         the show (space skips a part, q goes to the end)
       nospeaker "any words"             just say something
+      nospeaker link send               transmit UTF-8 from stdin (up to 160 bytes)
+      nospeaker link receive            listen and emit one JSON result
       nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
       --voice Daniel                    any voice from `say -v '?'`
       --dark                            white on black instead of black on white
@@ -1568,11 +1831,33 @@ applyTheme(light: !flag("--dark"))
 let plain = flag("--plain")
 let wantsSweep = flag("--sweep")
 preferExternal = flag("--external")
-if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
 
 signal(SIGINT) { _ in requestEnd() }
 signal(SIGTERM) { _ in stopRequested = true }
 atexit { restoreTerminal() }
+
+if args == ["link", "send"] {
+    sendLink()
+    exit(interrupted() ? 130 : 0)
+}
+if args.starts(with: ["link", "receive"]) {
+    let timeout: Int
+    switch args.count {
+    case 2:
+        timeout = 180
+    case 4:
+        guard args[2] == "--timeout", let value = Int(args[3]), (1...600).contains(value) else {
+            usageError("receive expects --timeout followed by 1–600 seconds.")
+        }
+        timeout = value
+    default:
+        usageError("receive expects only the optional --timeout argument.")
+    }
+    receiveLink(timeout: timeout)
+    exit(0)
+}
+
+if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
 
 motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()

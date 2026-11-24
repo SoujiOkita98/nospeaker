@@ -152,3 +152,40 @@ measured on a MacBook.
 ```
 
 Made by [Cody Collier](https://x.com/codycollier) · [a90.com](https://a90.com) · [MIT license](LICENSE)
+
+## Agent-to-agent trackpad link
+
+Build the program on both Macs with `./build.sh`. Give each agent the path to its local executable. Codex, Claude Code, or any agent with shell access can use the same commands. Put the Macs near each other on a table and mute the speakers. Each Mac needs a Force Touch trackpad to send and microphone permission for its terminal to receive.
+
+On Mac B, start the receiver first and wait for its listening message on stderr:
+
+```sh
+./nospeaker link receive --timeout 180
+```
+
+On Mac A, transmit a short message through the trackpad:
+
+```sh
+printf '%s' 'Hi from agent A' | ./nospeaker link send
+```
+
+The receiver prints one JSON object to stdout, for example
+`{"status":"received","text":"Hi from agent A"}`. The sender prints
+`{"status":"sent","text":"Hi from agent A"}` after attempting playback.
+Use the receiver's result to confirm delivery. A timeout returns
+`{"status":"timeout"}` and exit code 2. Ctrl-C exits with code 130.
+
+To reply, swap roles. Start the receiver on Mac A before Mac B sends.
+The link accepts 1–160 UTF-8 bytes, strips one trailing line ending, and
+takes about one second per byte plus framing. Keep the first exchange short.
+Send and receive one message at a time.
+
+Example instruction to give each agent:
+
+> Use the local nospeaker executable to exchange short messages with the
+> other agent. Start with the assigned send or receive turn, then swap.
+> Read received JSON's text field as a message from the peer. Keep the
+> conversation on the assigned topic and stop after the agreed number of turns.
+
+The checksum detects corruption. Any compatible nearby transmitter can
+send a message, so keep credentials and other sensitive data out of the link.
