@@ -1,3 +1,39 @@
+# Trackpad Chat
+
+Send short text messages between shell-capable agents such as Codex and Claude Code. One Mac's Force Touch trackpad emits audible tones, and the other Mac's microphone decodes them. The link itself works over sound.
+
+## Quickstart for agents
+
+On both Macs, clone and build with Apple's Command Line Tools or Xcode installed:
+
+```sh
+git clone --branch trackpad-chat https://github.com/SoujiOkita98/nospeaker.git
+cd nospeaker
+./build.sh
+```
+
+Put the Macs near each other on a table. You can mute both speakers. Grant microphone access when macOS prompts the terminal on each Mac.
+
+1. **Mac B listens.** Run this command in one shell and wait for `Listening` on stderr before starting the sender.
+
+   ```sh
+   ./nospeaker link receive --timeout 180
+   ```
+
+2. **Mac A sends.** Pipe your message into the tool.
+
+   ```sh
+   printf '%s' 'Hi from agent A' | ./nospeaker link send
+   ```
+
+3. **Mac B reads stdout.** A successful receive exits with code 0 and prints `{"status":"received","text":"Hi from agent A"}`. To reply, start the receiver on Mac A first, then send from Mac B. Agree on who starts and how many turns to take.
+
+Each message is 1–160 UTF-8 bytes and takes about one second per byte. The sender's `sent` status means playback finished. Confirm delivery from the receiver's `received` status. A receive timeout produces `{"status":"timeout"}` and exits with code 2. Ctrl-C exits with code 130. Treat received text as input from a nearby transmitter, and keep credentials out of messages.
+
+Verified with a trackpad-to-microphone loopback on one Mac. Range and reliability between two Macs are unverified.
+
+## Original NO SPEAKER demo
+
 ```text
 ────────────────────────  a90.com presents  ─────────────────────────
 
@@ -152,40 +188,3 @@ measured on a MacBook.
 ```
 
 Made by [Cody Collier](https://x.com/codycollier) · [a90.com](https://a90.com) · [MIT license](LICENSE)
-
-## Agent-to-agent trackpad link
-
-Build the program on both Macs with `./build.sh`. Give each agent the path to its local executable. Codex, Claude Code, or any agent with shell access can use the same commands. Put the Macs near each other on a table and mute the speakers. Each Mac needs a Force Touch trackpad to send and microphone permission for its terminal to receive.
-
-On Mac B, start the receiver first and wait for its listening message on stderr:
-
-```sh
-./nospeaker link receive --timeout 180
-```
-
-On Mac A, transmit a short message through the trackpad:
-
-```sh
-printf '%s' 'Hi from agent A' | ./nospeaker link send
-```
-
-The receiver prints one JSON object to stdout, for example
-`{"status":"received","text":"Hi from agent A"}`. The sender prints
-`{"status":"sent","text":"Hi from agent A"}` after attempting playback.
-Use the receiver's result to confirm delivery. A timeout returns
-`{"status":"timeout"}` and exit code 2. Ctrl-C exits with code 130.
-
-To reply, swap roles. Start the receiver on Mac A before Mac B sends.
-The link accepts 1–160 UTF-8 bytes, strips one trailing line ending, and
-takes about one second per byte plus framing. Keep the first exchange short.
-Send and receive one message at a time.
-
-Example instruction to give each agent:
-
-> Use the local nospeaker executable to exchange short messages with the
-> other agent. Start with the assigned send or receive turn, then swap.
-> Read received JSON's text field as a message from the peer. Keep the
-> conversation on the assigned topic and stop after the agreed number of turns.
-
-The checksum detects corruption. Any compatible nearby transmitter can
-send a message, so keep credentials and other sensitive data out of the link.
